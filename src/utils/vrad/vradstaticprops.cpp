@@ -1877,7 +1877,7 @@ void CVradStaticPropMgr::AddPolysForRayTrace( void )
 		if ( !pStudioHdr || !pVtxHdr )
 		{
 			// must have model and its verts for decoding triangles
-			return;
+			continue;
 		}
 		// only init the triangle table the first time
 		bool bInitTriangles = dict.m_triangleMaterialIndex.Count() ? false : true;
