@@ -38,6 +38,7 @@
 #include "messbuf.h"
 #include "vmpi.h"
 #include "vmpi_distribute_work.h"
+#include "shadowtexturelist.h"
 
 
 #define ALIGN_TO_POW2(x,y) (((x)+(y-1))&~(y-1))
@@ -642,249 +643,256 @@ bool LoadFileIntoBuffer( CUtlBuffer &buf, const char *pFilename )
 	return true;
 }
 
-// keeps a list of all textures that cast shadows via alpha channel
-class CShadowTextureList
+// This loads a vtf and converts it to RGB8888 format
+unsigned char *CShadowTextureList::LoadVTFRGB8888( const char *pName, int *pWidth, int *pHeight, bool *pClampU, bool *pClampV )
 {
-public:
-	// This loads a vtf and converts it to RGB8888 format
-	unsigned char *LoadVTFRGB8888( const char *pName, int *pWidth, int *pHeight, bool *pClampU, bool *pClampV )
+	char szPath[MAX_PATH];
+	Q_strncpy( szPath, "materials/", sizeof( szPath ) );
+	Q_strncat( szPath, pName, sizeof( szPath ), COPY_ALL_CHARACTERS );
+	Q_strncat( szPath, ".vtf", sizeof( szPath ), COPY_ALL_CHARACTERS );
+	Q_FixSlashes( szPath, CORRECT_PATH_SEPARATOR );
+
+	CUtlBuffer buf;
+	if ( !LoadFileIntoBuffer( buf, szPath ) )
+		return NULL;
+	IVTFTexture *pTex = CreateVTFTexture();
+	if (!pTex->Unserialize( buf ))
+		return NULL;
+	Msg("Loaded alpha texture %s\n", szPath );
+	unsigned char *pSrcImage = pTex->ImageData( 0, 0, 0, 0, 0, 0 );
+	int iWidth = pTex->Width();
+	int iHeight = pTex->Height();
+	ImageFormat dstFormat = IMAGE_FORMAT_RGBA8888;
+	ImageFormat srcFormat = pTex->Format();
+	*pClampU = (pTex->Flags() & TEXTUREFLAGS_CLAMPS) ? true : false;
+	*pClampV = (pTex->Flags() & TEXTUREFLAGS_CLAMPT) ? true : false;
+	unsigned char *pDstImage = new unsigned char[ImageLoader::GetMemRequired( iWidth, iHeight, 1, dstFormat, false )];
+
+	if( !ImageLoader::ConvertImageFormat( pSrcImage, srcFormat, 
+		pDstImage, dstFormat, iWidth, iHeight, 0, 0 ) )
 	{
-		char szPath[MAX_PATH];
-		Q_strncpy( szPath, "materials/", sizeof( szPath ) );
-		Q_strncat( szPath, pName, sizeof( szPath ), COPY_ALL_CHARACTERS );
-		Q_strncat( szPath, ".vtf", sizeof( szPath ), COPY_ALL_CHARACTERS );
-		Q_FixSlashes( szPath, CORRECT_PATH_SEPARATOR );
-
-		CUtlBuffer buf;
-		if ( !LoadFileIntoBuffer( buf, szPath ) )
-			return NULL;
-		IVTFTexture *pTex = CreateVTFTexture();
-		if (!pTex->Unserialize( buf ))
-			return NULL;
-		Msg("Loaded alpha texture %s\n", szPath );
-		unsigned char *pSrcImage = pTex->ImageData( 0, 0, 0, 0, 0, 0 );
-		int iWidth = pTex->Width();
-		int iHeight = pTex->Height();
-		ImageFormat dstFormat = IMAGE_FORMAT_RGBA8888;
-		ImageFormat srcFormat = pTex->Format();
-		*pClampU = (pTex->Flags() & TEXTUREFLAGS_CLAMPS) ? true : false;
-		*pClampV = (pTex->Flags() & TEXTUREFLAGS_CLAMPT) ? true : false;
-		unsigned char *pDstImage = new unsigned char[ImageLoader::GetMemRequired( iWidth, iHeight, 1, dstFormat, false )];
-
-		if( !ImageLoader::ConvertImageFormat( pSrcImage, srcFormat, 
-			pDstImage, dstFormat, iWidth, iHeight, 0, 0 ) )
-		{
-			delete[] pDstImage;
-			return NULL;
-		}
-
-		*pWidth = iWidth;
-		*pHeight = iHeight;
-		return pDstImage;
+		delete[] pDstImage;
+		return NULL;
 	}
 
-	// Checks the database for the material and loads if necessary
-	// returns true if found and pIndex will be the index, -1 if no alpha shadows
-	bool FindOrLoadIfValid( const char *pMaterialName, int *pIndex )
+	*pWidth = iWidth;
+	*pHeight = iHeight;
+	return pDstImage;
+}
+
+// Checks the database for the material and loads if necessary
+// returns true if found and pIndex will be the index, -1 if no alpha shadows
+bool CShadowTextureList::FindOrLoadIfValid( const char *pMaterialName, int *pIndex, int *pIndex2 )
+{
+	*pIndex = -1;
+	int index = m_Textures.Find(pMaterialName);
+	bool bFound = false;
+	if ( index != m_Textures.InvalidIndex() )
 	{
-		*pIndex = -1;
-		int index = m_Textures.Find(pMaterialName);
-		bool bFound = false;
-		if ( index != m_Textures.InvalidIndex() )
+		bFound = true;
+		*pIndex = index;
+	}
+	else
+	{
+		KeyValues *pVMT = new KeyValues("vmt");
+		CUtlBuffer buf(0,0,CUtlBuffer::TEXT_BUFFER);
+		LoadFileIntoBuffer( buf, pMaterialName );
+		if ( pVMT->LoadFromBuffer( pMaterialName, buf ) )
 		{
 			bFound = true;
-			*pIndex = index;
-		}
-		else
-		{
-			KeyValues *pVMT = new KeyValues("vmt");
-			CUtlBuffer buf(0,0,CUtlBuffer::TEXT_BUFFER);
-			LoadFileIntoBuffer( buf, pMaterialName );
-			if ( pVMT->LoadFromBuffer( pMaterialName, buf ) )
+
+			// if this is a patch material we need to merge the included KV's
+			if ( !V_stricmp( pVMT->GetName(), "patch" ) )
 			{
-				bFound = true;
-				KeyValues *pBaseTexture = pVMT->FindKey("%alphatexture");
-				if ( pBaseTexture || pVMT->FindKey("$alphatest") || pVMT->FindKey("$translucent") )
+				int depth = 0;
+				const int maxPatchDepth = 2; // potential of recursive patches
+				while ( depth++ < maxPatchDepth )
 				{
-					if ( !pBaseTexture )
+					KeyValues *includeKV = pVMT->FindKey( "include" );
+					if ( !includeKV )
+						break;
+
+					const char *includedVMT = includeKV->GetString();
+					if ( !includedVMT )
+						break;
+
+					CUtlBuffer bufPatch( 0, 0, CUtlBuffer::TEXT_BUFFER );
+					LoadFileIntoBuffer( bufPatch, includedVMT );
+					KeyValuesAD kvPatchVMT( "vmt" );
+					if ( kvPatchVMT->LoadFromBuffer( includedVMT, bufPatch ) )
 					{
-						pBaseTexture = pVMT->FindKey("$basetexture");
+						pVMT->RemoveSubKey( includeKV );
+						pVMT->RecursiveMergeKeyValues( kvPatchVMT );
+						if ( V_stricmp( kvPatchVMT->GetName(), "patch" ) )
+							break;
 					}
-					if ( pBaseTexture )
+				}
+			}
+
+			int isTranslucent = pVMT->FindKey( "$translucent" ) || pVMT->FindKey( "$alphatest" );
+			KeyValues *pBaseTexture = pVMT->FindKey( "%alphatexture" );
+			if ( !pBaseTexture )
+				pBaseTexture = pVMT->FindKey( "$basetexture" );
+
+			if ( pBaseTexture && isTranslucent )
+			{
+				const char *pBaseTextureName = pBaseTexture->GetString();
+				if ( pBaseTextureName )
+				{
+					int w, h;
+					bool bClampU = false;
+					bool bClampV = false;
+					unsigned char *pImageBits = LoadVTFRGB8888( pBaseTextureName, &w, &h, &bClampU, &bClampV );
+					if ( pImageBits )
 					{
-						const char *pBaseTextureName = pBaseTexture->GetString();
-						if ( pBaseTextureName )
-						{
-							int w, h;
-							bool bClampU = false;
-							bool bClampV = false;
-							unsigned char *pImageBits = LoadVTFRGB8888( pBaseTextureName, &w, &h, &bClampU, &bClampV );
-							if ( pImageBits )
-							{
-								int index = m_Textures.Insert( pMaterialName );
-								m_Textures[index].InitFromRGB8888( w, h, pImageBits );
-								*pIndex = index;
-								if ( pVMT->FindKey("$nocull") )
-								{
-									// UNDONE: Support this? Do we need to emit two triangles?
-									m_Textures[index].allowBackface = true;
-								}
-								m_Textures[index].clampU = bClampU;
-								m_Textures[index].clampV = bClampV;
-								delete[] pImageBits;
-							}
-						}
+						int index = m_Textures.Insert( pMaterialName );
+						m_Textures[index].InitFromRGB8888( w, h, pImageBits );
+						*pIndex = index;
+						m_Textures[index].allowBackface = pVMT->FindKey( "$nocull" );
+						m_Textures[index].clampU = bClampU;
+						m_Textures[index].clampV = bClampV;
+						delete[] pImageBits;
 					}
 				}
 
-			}
-			pVMT->deleteThis();
-		}
+				// build a matrix transformation for the material to be used in casting later
+				const char *pBaseTextureTransform = pVMT->GetString( "$basetexturetransform", nullptr );
+				if ( pBaseTextureTransform )
+				{
+					Vector center( 0, 0, 0 );
+					Vector scale( 1, 1, 1 );
+					float rotate;
+					Vector translate;
 
-		return bFound;
+					if ( sscanf( pBaseTextureTransform, "center %f %f scale %f %f rotate %f translate %f %f",
+						&center.x, &center.y, &scale.x, &scale.y, &rotate, &translate.x, &translate.y ) == 7 )
+					{
+						VMatrix transform;
+						transform.Identity();
+						// Apply our center translation first
+						transform.SetTranslation( center );
+						// typical TRS transformation after
+						transform = transform.Scale( scale );
+						VMatrix matRotation;
+						MatrixBuildRotateZ( matRotation, rotate );
+						MatrixMultiply( matRotation, transform, transform );
+						transform.PostTranslate( translate );
+						m_Textures[*pIndex].transform = transform;
+					}
+				}
+			}
+		}
+		pVMT->deleteThis();
 	}
 
+	return bFound;
+}
 
-	// iterate the textures for the model and load each one into the database
-	// this is used on models marked to cast texture shadows
-	void LoadAllTexturesForModel( studiohdr_t *pHdr, int *pTextureList )
+
+// iterate the textures for the model and load each one into the database
+// this is used on models marked to cast texture shadows
+void CShadowTextureList::LoadAllTexturesForModel( studiohdr_t *pHdr, int *pTextureList )
+{
+	for ( int i = 0; i < pHdr->numtextures; i++ )
 	{
-		for ( int i = 0; i < pHdr->numtextures; i++ )
+		int textureIndex = -1;
+		// try to add each texture to the transparent shadow manager
+		char szPath[MAX_PATH];
+
+		// iterate quietly through all specified directories until a valid material is found
+		for ( int j = 0; j < pHdr->numcdtextures; j++ )
 		{
-			int textureIndex = -1;
-			// try to add each texture to the transparent shadow manager
-			char szPath[MAX_PATH];
-
-			// iterate quietly through all specified directories until a valid material is found
-			for ( int j = 0; j < pHdr->numcdtextures; j++ )
-			{
-				Q_strncpy( szPath, "materials/", sizeof( szPath ) );
-				Q_strncat( szPath, pHdr->pCdtexture( j ), sizeof( szPath ) );
-				const char *textureName = pHdr->pTexture( i )->pszName();
-				Q_strncat( szPath, textureName, sizeof( szPath ), COPY_ALL_CHARACTERS );
-				Q_strncat( szPath, ".vmt", sizeof( szPath ), COPY_ALL_CHARACTERS );
-				Q_FixSlashes( szPath, CORRECT_PATH_SEPARATOR );
-				if ( FindOrLoadIfValid( szPath, &textureIndex ) )
-					break;
-			}
-
-			pTextureList[i] = textureIndex;
+			Q_strncpy( szPath, "materials/", sizeof( szPath ) );
+			Q_strncat( szPath, pHdr->pCdtexture( j ), sizeof( szPath ) );
+			const char *textureName = pHdr->pTexture( i )->pszName();
+			Q_strncat( szPath, textureName, sizeof( szPath ), COPY_ALL_CHARACTERS );
+			Q_strncat( szPath, ".vmt", sizeof( szPath ), COPY_ALL_CHARACTERS );
+			Q_FixSlashes( szPath, CORRECT_PATH_SEPARATOR );
+			if ( FindOrLoadIfValid( szPath, &textureIndex ) )
+				break;
 		}
+
+		pTextureList[i] = textureIndex;
 	}
+}
 	
-	int AddMaterialEntry( int shadowTextureIndex, const Vector2D &t0, const Vector2D &t1, const Vector2D &t2 )
+int CShadowTextureList::AddMaterialEntry( int shadowTextureIndex, const Vector2D &t0, const Vector2D &t1, const Vector2D &t2 )
+{
+	int index = m_MaterialEntries.AddToTail();
+	m_MaterialEntries[index].textureIndex = shadowTextureIndex;
+	m_MaterialEntries[index].uv[0] = t0;
+	m_MaterialEntries[index].uv[1] = t1;
+	m_MaterialEntries[index].uv[2] = t2;
+	return index;
+}
+
+// HACKHACK: Compute the average coverage for this triangle by sampling the AABB of its texture space
+float CShadowTextureList::ComputeCoverageForTriangle( int shadowTextureIndex, const Vector2D &t0, const Vector2D &t1, const Vector2D &t2 )
+{
+	float umin = min(t0.x, t1.x);
+	umin = min(umin, t2.x);
+	float umax = max(t0.x, t1.x);
+	umax = max(umax, t2.x);
+
+	float vmin = min(t0.y, t1.y);
+	vmin = min(vmin, t2.y);
+	float vmax = max(t0.y, t1.y);
+	vmax = max(vmax, t2.y);
+
+	const alphatexture_t &tex = m_Textures.Element(shadowTextureIndex);
+	int texWidth = tex.width;
+	int texHeight = tex.height;
+
+	int u0 = (int)(umin * texWidth);
+	int u1 = (int)(umax * texWidth);
+	int v0 = (int)(vmin * texHeight);
+	int v1 = (int)(vmax * texHeight);
+
+	unsigned int total = 0;
+	unsigned int count = 0;
+	for ( int v = v0; v <= v1; ++v )
 	{
-		int index = m_MaterialEntries.AddToTail();
-		m_MaterialEntries[index].textureIndex = shadowTextureIndex;
-		m_MaterialEntries[index].uv[0] = t0;
-		m_MaterialEntries[index].uv[1] = t1;
-		m_MaterialEntries[index].uv[2] = t2;
-		return index;
-	}
+		int wrappedV = ( ( v % texHeight ) + texHeight ) % texHeight;
+		int row = wrappedV * texWidth;
 
-	// HACKHACK: Compute the average coverage for this triangle by sampling the AABB of its texture space
-	float ComputeCoverageForTriangle( int shadowTextureIndex, const Vector2D &t0, const Vector2D &t1, const Vector2D &t2 )
+		for ( int u = u0; u <= u1; ++u )
+		{
+			int wrappedU = ( ( u % texWidth ) + texWidth ) % texWidth;
+			total += tex.pAlphaTexels[row + wrappedU];
+			count++;
+		}
+	}
+	if ( count )
 	{
-		float umin = min(t0.x, t1.x);
-		umin = min(umin, t2.x);
-		float umax = max(t0.x, t1.x);
-		umax = max(umax, t2.x);
-
-		float vmin = min(t0.y, t1.y);
-		vmin = min(vmin, t2.y);
-		float vmax = max(t0.y, t1.y);
-		vmax = max(vmax, t2.y);
-
-		// UNDONE: Do something about tiling
-		umin = clamp(umin, 0, 1);
-		umax = clamp(umax, 0, 1);
-		vmin = clamp(vmin, 0, 1);
-		vmax = clamp(vmax, 0, 1);
-		Assert(umin>=0.0f && umax <= 1.0f);
-		Assert(vmin>=0.0f && vmax <= 1.0f);
-		const alphatexture_t &tex = m_Textures.Element(shadowTextureIndex);
-		int u0 = umin * (tex.width-1);
-		int u1 = umax * (tex.width-1);
-		int v0 = vmin * (tex.height-1);
-		int v1 = vmax * (tex.height-1);
-
-		int total = 0;
-		int count = 0;
-		for ( int v = v0; v <= v1; v++ )
-		{
-			int row = (v * tex.width);
-			for ( int u = u0; u <= u1; u++ )
-			{
-				total += tex.pAlphaTexels[row + u];
-				count++;
-			}
-		}
-		if ( count )
-		{
-			float coverage = float(total) / (count * 255.0f);
-			return coverage;
-		}
-		return 1.0f;
+		float coverage = float(total) / (count * 255.0f);
+		return coverage;
 	}
+	return 1.0f;
+}
 	
-	int SampleMaterial( int materialIndex, const Vector &coords, bool bBackface )
-	{
-		const materialentry_t &mat = m_MaterialEntries[materialIndex];
-		const alphatexture_t &tex = m_Textures.Element(m_MaterialEntries[materialIndex].textureIndex);
-		if ( bBackface && !tex.allowBackface )
-			return 0;
-		Vector2D uv = coords.x * mat.uv[0] + coords.y * mat.uv[1] + coords.z * mat.uv[2];
-		int u = RoundFloatToInt( uv[0] * tex.width );
-		int v = RoundFloatToInt( uv[1] * tex.height );
+int CShadowTextureList::SampleMaterial( int materialIndex, const Vector &coords, bool bBackface )
+{
+	const materialentry_t &mat = m_MaterialEntries[materialIndex];
+	const alphatexture_t &tex = m_Textures.Element(m_MaterialEntries[materialIndex].textureIndex);
+	if ( bBackface && !tex.allowBackface )
+		return 0;
+	Vector2D uv = coords.x * mat.uv[0] + coords.y * mat.uv[1] + coords.z * mat.uv[2];
+	int u = RoundFloatToInt( uv[0] * tex.width );
+	int v = RoundFloatToInt( uv[1] * tex.height );
 		
-		// asume power of 2, clamp or wrap
-		// UNDONE: Support clamp?  This code should work
+	// asume power of 2, clamp or wrap
+	// UNDONE: Support clamp?  This code should work
 #if 0
-		u = tex.clampU ? clamp(u,0,(tex.width-1)) : (u & (tex.width-1));
-		v = tex.clampV ? clamp(v,0,(tex.height-1)) : (v & (tex.height-1));
+	u = tex.clampU ? clamp(u,0,(tex.width-1)) : (u & (tex.width-1));
+	v = tex.clampV ? clamp(v,0,(tex.height-1)) : (v & (tex.height-1));
 #else
-		// for now always wrap
-		u &= (tex.width-1);
-		v &= (tex.height-1);
+	// for now always wrap
+	u &= (tex.width-1);
+	v &= (tex.height-1);
 #endif
 
-		return tex.pAlphaTexels[v * tex.width + u];
-	}
-
-	struct alphatexture_t 
-	{
-		short width;
-		short height;
-		bool allowBackface;
-		bool clampU;
-		bool clampV;
-		unsigned char *pAlphaTexels;
-
-		void InitFromRGB8888( int w, int h, unsigned char *pTexels )
-		{
-			width = w;
-			height = h;
-			pAlphaTexels = new unsigned char[w*h];
-			for ( int i = 0; i < h; i++ )
-			{
-				for ( int j = 0; j < w; j++ )
-				{
-					int index = (i*w) + j;
-					pAlphaTexels[index] = pTexels[index*4 + 3];
-				}
-			}
-		}
-	};
-	struct materialentry_t
-	{
-		int textureIndex;
-		Vector2D uv[3];
-	};
-	// this is the list of textures we've loaded
-	// only load each one once
-	CUtlDict< alphatexture_t, unsigned short > m_Textures;
-	CUtlVector<materialentry_t> m_MaterialEntries;
-};
+	return tex.pAlphaTexels[v * tex.width + u];
+}
 
 // global to keep the shadow-casting texture list and their alpha bits
 CShadowTextureList g_ShadowTextureList;

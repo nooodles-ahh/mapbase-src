@@ -75,6 +75,8 @@ protected:
 	float					m_flSampleHeight;
 	CUtlVector<Vector2D>	m_aLuxelCoords;							// Lightmap coordinates.
 	CUtlVector<Vector>		m_aVertNormals;							// Displacement vertex normals
+	CDispVector<Vector>		m_aFlatVerts;
+
 };
 
 #endif // VRAD_DISPCOLL_H

@@ -119,6 +119,7 @@ bool		g_bStaticPropLighting = false;
 bool        g_bStaticPropPolys = false;
 bool        g_bTextureShadows = false;
 bool        g_bDisablePropSelfShadowing = false;
+bool        g_bWorldTextureShadows = true;
 
 
 CUtlVector<byte> g_FacesVisibleToLights;
@@ -2812,6 +2813,10 @@ int ParseCommandLine( int argc, char **argv, bool *onlydetail )
 				break;
 		}
 #endif
+		else if ( !V_stricmp( argv[i], "-worldtextureshadows" ) )
+		{
+			g_bWorldTextureShadows = true;
+		}
 		else if ( mapArg == -1 )
 		{
 			mapArg = i;
@@ -2914,6 +2919,7 @@ void PrintUsage( int argc, char **argv )
 		"  -textureshadows : Allows texture alpha channels to block light - rays intersecting alpha surfaces will sample the texture\n"
 		"  -noskyboxrecurse : Turn off recursion into 3d skybox (skybox shadows on world)\n"
 		"  -nossprops      : Globally disable self-shadowing on static props\n"
+		"  -WorldTextureShadows : Allow world geometry to cast texture shadows\n",
 		"\n"
 #if 1 // Disabled for the initial SDK release with VMPI so we can get feedback from selected users.
 		);

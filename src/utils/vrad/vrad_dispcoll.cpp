@@ -11,6 +11,7 @@
 #include "radial.h"
 #include "CollisionUtils.h"
 #include "tier0\dbg.h"
+#include "shadowtexturelist.h"
 
 #define SAMPLE_BBOX_SLOP		5.0f
 #define TRIEDGE_EPSILON			0.001f
@@ -33,6 +34,7 @@ CVRADDispColl::CVRADDispColl()
 
 	m_aLuxelCoords.Purge();
 	m_aVertNormals.Purge();
+	m_aFlatVerts.Purge();
 }
 	
 //-----------------------------------------------------------------------------
@@ -41,6 +43,7 @@ CVRADDispColl::~CVRADDispColl()
 {
 	m_aLuxelCoords.Purge();
 	m_aVertNormals.Purge();
+	m_aFlatVerts.Purge();
 }
 
 //-----------------------------------------------------------------------------
@@ -54,6 +57,7 @@ bool CVRADDispColl::Create( CCoreDispInfo *pDisp )
 	// Allocate VRad specific memory.
 	m_aLuxelCoords.SetSize( GetSize() );
 	m_aVertNormals.SetSize( GetSize() );
+	m_aFlatVerts.SetSize( GetSize() );
 
 	// VRad specific base surface data.
 	CCoreDispSurface *pSurf = pDisp->GetSurface();
@@ -64,6 +68,7 @@ bool CVRADDispColl::Create( CCoreDispInfo *pDisp )
 	{
 		pDisp->GetNormal( iVert, m_aVertNormals[iVert] );
 		pDisp->GetLuxelCoord( 0, iVert, m_aLuxelCoords[iVert] );
+		pDisp->GetFlatVert( iVert, m_aFlatVerts[iVert] );
 	}
 
 	// Re-calculate the lightmap size (in uv) so that the luxels give
@@ -1064,17 +1069,79 @@ bool CVRADDispColl::InitPatch( int iPatch, int iParentPatch, int iChild, Vector 
 void CVRADDispColl::AddPolysForRayTrace( void )
 {
 	if ( !( m_nContents & MASK_OPAQUE ) )
-		return;
+	{
+		if ( !g_bWorldTextureShadows || !( m_nContents & ( CONTENTS_WINDOW | CONTENTS_GRATE ) ) )
+			return;
+	}
+
+	dface_t *pFace = &g_pFaces[m_iParent];
+	texinfo_t *tx = &texinfo[pFace->texinfo];
+
+	int shadowTextureIndex = -1;
+	if ( g_bWorldTextureShadows )
+	{
+		const char *pMaterialName = TexDataStringTable_GetString( dtexdata[tx->texdata].nameStringTableID );
+		char texturePath[MAX_PATH];
+		V_sprintf_safe( texturePath, "materials/%s.vmt", pMaterialName );
+		g_ShadowTextureList.FindOrLoadIfValid( texturePath, &shadowTextureIndex );
+	}
+
+	const int texW = shadowTextureIndex != -1 ? g_ShadowTextureList.m_Textures[shadowTextureIndex].width : 1;
+	const int texH = shadowTextureIndex != -1 ? g_ShadowTextureList.m_Textures[shadowTextureIndex].height : 1;
+
+	// Texture shift
+	const float textureShiftX = tx->textureVecsTexelsPerWorldUnits[0][3];
+	const float textureShiftY = tx->textureVecsTexelsPerWorldUnits[1][3];
+
+	// UV Vectors (X Y Z)
+	Vector u( tx->textureVecsTexelsPerWorldUnits[0][0], tx->textureVecsTexelsPerWorldUnits[0][1], tx->textureVecsTexelsPerWorldUnits[0][2] );
+	Vector v( tx->textureVecsTexelsPerWorldUnits[1][0], tx->textureVecsTexelsPerWorldUnits[1][1], tx->textureVecsTexelsPerWorldUnits[1][2] );
+
+	if ( shadowTextureIndex != -1 )
+	{
+		// Apply our $BaseTextureTransform
+		u = g_ShadowTextureList.m_Textures[shadowTextureIndex].transform.VMul3x3( u );
+		v = g_ShadowTextureList.m_Textures[shadowTextureIndex].transform.VMul3x3( v );
+	}
 
 	for ( int ndxTri = 0; ndxTri < m_aTris.Size(); ndxTri++ )
 	{
 		CDispCollTri *tri = m_aTris.Base() + ndxTri;
-		int v[3];
+		int vert[3];
 		for ( int ndxv = 0; ndxv < 3; ndxv++ )
-			v[ndxv] = tri->GetVert(ndxv);
+			vert[ndxv] = tri->GetVert( ndxv );
 
-		Vector fullCoverage;
-		fullCoverage.x = 1.0f;
-		g_RtEnv.AddTriangle( TRACE_ID_OPAQUE, m_aVerts[v[0]], m_aVerts[v[1]], m_aVerts[v[2]], fullCoverage );
+
+		if ( shadowTextureIndex != -1 )
+		{
+			// apply our UV transformations to the winding points
+			const Vector2D t0(
+				( DOT_PRODUCT( m_aFlatVerts[vert[0]], u ) + textureShiftX ) / texW,
+				( DOT_PRODUCT( m_aFlatVerts[vert[0]], v ) + textureShiftY ) / texH );
+			const Vector2D t1(
+				( DOT_PRODUCT( m_aFlatVerts[vert[1]], u ) + textureShiftX ) / texW,
+				( DOT_PRODUCT( m_aFlatVerts[vert[1]], v ) + textureShiftY ) / texH );
+			const Vector2D t2(
+				( DOT_PRODUCT( m_aFlatVerts[vert[2]], u ) + textureShiftX ) / texW,
+				( DOT_PRODUCT( m_aFlatVerts[vert[2]], v ) + textureShiftY ) / texH );
+
+
+			Vector fullCoverage( g_ShadowTextureList.ComputeCoverageForTriangle( shadowTextureIndex, t0, t1, t2 ), 0, 0 );
+			if ( fullCoverage.x < 1.f )
+			{
+				int materialIndex = g_ShadowTextureList.AddMaterialEntry( shadowTextureIndex, t0, t1, t2 );
+				g_RtEnv.AddTriangle( TRACE_ID_OPAQUE, m_aVerts[vert[0]], m_aVerts[vert[1]], m_aVerts[vert[2]], fullCoverage, FCACHETRI_TRANSPARENT, materialIndex );
+			}
+			else
+			{
+				g_RtEnv.AddTriangle( TRACE_ID_OPAQUE, m_aVerts[vert[0]], m_aVerts[vert[1]], m_aVerts[vert[2]], fullCoverage, 0, -1 );
+			}
+		}
+		else
+		{
+			Vector fullCoverage;
+			fullCoverage.x = 1.0f;
+			g_RtEnv.AddTriangle( TRACE_ID_OPAQUE, m_aVerts[vert[0]], m_aVerts[vert[1]], m_aVerts[vert[2]], fullCoverage );
+		}
 	}
 }
