@@ -1843,7 +1843,7 @@ void GatherSampleStandardLightSSE( SSE_sampleLightOutput_t &out, directlight_t *
 	FourVectors src;
 	src.DuplicateVector( vec3_origin );
 
-	if (dl->facenum == -1)
+	if ( dl->facenum == -1 )
 	{
 		src.DuplicateVector( dl->light.origin );
 	}
@@ -1867,9 +1867,9 @@ void GatherSampleStandardLightSSE( SSE_sampleLightOutput_t &out, directlight_t *
 	bool bHasHardFalloff = ( dl->m_flEndFadeDistance > dl->m_flStartFadeDistance );
 	if ( bHasHardFalloff )
 	{
-		fltx4 notPastFadeDist = CmpLeSIMD ( dist, ReplicateX4 ( dl->m_flEndFadeDistance ) );
+		fltx4 notPastFadeDist = CmpLeSIMD( dist, ReplicateX4( dl->m_flEndFadeDistance ) );
 		dot = AndSIMD( dot, notPastFadeDist );  // dot = 0 if past fade distance
-		if ( !TestSignSIMD ( notPastFadeDist ) )
+		if ( !TestSignSIMD( notPastFadeDist ) )
 			return;
 	}
 
@@ -1880,11 +1880,11 @@ void GatherSampleStandardLightSSE( SSE_sampleLightOutput_t &out, directlight_t *
 	fltx4 dot2, inCone, inFringe, mult;
 	FourVectors offset;
 
-	switch (dl->light.type)
+	switch ( dl->light.type )
 	{
 	case emit_point:
-		constant  = ReplicateX4( dl->light.constant_attn );
-		linear    = ReplicateX4( dl->light.linear_attn );
+		constant = ReplicateX4( dl->light.constant_attn );
+		linear = ReplicateX4( dl->light.linear_attn );
 		quadratic = ReplicateX4( dl->light.quadratic_attn );
 
 		out.m_flFalloff = MulSIMD( falloffEvalDist, falloffEvalDist );
@@ -1903,11 +1903,11 @@ void GatherSampleStandardLightSSE( SSE_sampleLightOutput_t &out, directlight_t *
 		if ( TestSignSIMD( CmpEqSIMD( Four_Zeros, dot ) ) == 0xF )
 			return;
 
-		out.m_flFalloff = ReciprocalSIMD ( dist2 );
+		out.m_flFalloff = ReciprocalSIMD( dist2 );
 		out.m_flFalloff = MulSIMD( out.m_flFalloff, dot2 );
 
 		// move the endpoint away from the surface by epsilon to prevent hitting the surface with the trace
-		offset.DuplicateVector ( dl->light.normal );
+		offset.DuplicateVector( dl->light.normal );
 		offset *= DIST_EPSILON;
 		src += offset;
 		break;
@@ -1918,12 +1918,12 @@ void GatherSampleStandardLightSSE( SSE_sampleLightOutput_t &out, directlight_t *
 
 		// Affix dot2 to zero if outside light cone
 		inCone = CmpGtSIMD( dot2, ReplicateX4( dl->light.stopdot2 ) );
-		if ( !TestSignSIMD ( inCone ) )
+		if ( !TestSignSIMD( inCone ) )
 			return;
 		dot = AndSIMD( inCone, dot );
 
-		constant  = ReplicateX4( dl->light.constant_attn );
-		linear    = ReplicateX4( dl->light.linear_attn );
+		constant = ReplicateX4( dl->light.constant_attn );
+		linear = ReplicateX4( dl->light.linear_attn );
 		quadratic = ReplicateX4( dl->light.quadratic_attn );
 
 		out.m_flFalloff = MulSIMD( falloffEvalDist, falloffEvalDist );
@@ -1942,7 +1942,7 @@ void GatherSampleStandardLightSSE( SSE_sampleLightOutput_t &out, directlight_t *
 		mult = MaxSIMD( mult, Four_Zeros );
 
 		// pow is fixed point, so this isn't the most accurate, but it doesn't need to be
-		if ( (dl->light.exponent != 0.0f ) && ( dl->light.exponent != 1.0f ) )
+		if ( ( dl->light.exponent != 0.0f ) && ( dl->light.exponent != 1.0f ) )
 			mult = PowSIMD( mult, dl->light.exponent );
 
 		// if not in between inner and outer cones, mult by 1
@@ -1971,16 +1971,48 @@ void GatherSampleStandardLightSSE( SSE_sampleLightOutput_t &out, directlight_t *
 		// t * t * t *( t * ( t* 6.0 - 15.0 ) + 10.0 )
 		mult = SubSIMD( MulSIMD( ReplicateX4( 6.0f ), t ), ReplicateX4( 15.0f ) );
 		mult = AddSIMD( MulSIMD( mult, t ), ReplicateX4( 10.0f ) );
-		mult = MulSIMD( MulSIMD( t, t), mult );
+		mult = MulSIMD( MulSIMD( t, t ), mult );
 		mult = MulSIMD( t, mult );
 		out.m_flFalloff = MulSIMD( mult, out.m_flFalloff );
 	}
 
 	// Raytrace for visibility function
-	fltx4 fractionVisible = Four_Ones;
-	TestLine( pos, src, &fractionVisible, static_prop_index_to_ignore);
-	dot = MulSIMD( fractionVisible, dot );
-	out.m_flDot[0] = dot;
+
+	// I'm encountering an issue where random black dots and lines keep appearing in
+	// shadows cast by textures. The problem actually lies in raytrace but SIMD
+	// is a bit beyond me. If I instead do 4 single traces it looks fine. So
+	// that's what this does.
+	FourRays myrays;
+	myrays.origin = pos;
+	myrays.direction = src;
+	myrays.direction -= myrays.origin;
+	fltx4 len = myrays.direction.length();
+	myrays.direction *= ReciprocalSIMD( len );
+	int msk = myrays.CalculateDirectionSignMask();
+	if ( msk != -1 )
+	{
+		fltx4 fractionVisible = Four_Ones;
+		TestLine( pos, src, &fractionVisible, static_prop_index_to_ignore );
+		dot = MulSIMD( fractionVisible, dot );
+		out.m_flDot[0] = dot;
+	}
+	else
+	{
+		for ( int l = 0; l < 4; ++l )
+		{
+			FourVectors fvPos;
+			FourVectors fvSrc;
+			fltx4 fxDot;
+			fvPos.DuplicateVector( pos.Vec( l ) );
+			fvSrc.DuplicateVector( src.Vec( l ) );
+			fxDot = ReplicateX4( dot.m128_f32[0] );
+
+			fltx4 fractionVisible = Four_Ones;
+			TestLine( fvPos, fvSrc, &fractionVisible, static_prop_index_to_ignore );
+			fxDot = MulSIMD( fractionVisible, fxDot );
+			out.m_flDot[0].m128_f32[l] = fxDot.m128_f32[0];
+		}
+	}
 
 	for ( int i = 1; i < normalCount; i++ )
 	{
