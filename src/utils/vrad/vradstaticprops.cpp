@@ -682,7 +682,7 @@ unsigned char *CShadowTextureList::LoadVTFRGB8888( const char *pName, int *pWidt
 
 // Checks the database for the material and loads if necessary
 // returns true if found and pIndex will be the index, -1 if no alpha shadows
-bool CShadowTextureList::FindOrLoadIfValid( const char *pMaterialName, int *pIndex, int *pIndex2 )
+bool CShadowTextureList::FindOrLoadIfValid( const char *pMaterialName, int *pIndex )
 {
 	*pIndex = -1;
 	int index = m_Textures.Find(pMaterialName);

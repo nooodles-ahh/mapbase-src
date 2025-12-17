@@ -13,7 +13,7 @@ public:
 
 	// Checks the database for the material and loads if necessary
 	// returns true if found and pIndex will be the index, -1 if no alpha shadows
-	bool FindOrLoadIfValid( const char *pMaterialName, int *pIndex, int *pIndex2 = nullptr );
+	bool FindOrLoadIfValid( const char *pMaterialName, int *pIndex );
 
 	// iterate the textures for the model and load each one into the database
 	// this is used on models marked to cast texture shadows
